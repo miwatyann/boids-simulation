@@ -1,68 +1,71 @@
-# Boids 生態系シミュレーション（GPU / Compute Shader）
+# Boids 群れシミュレーション（GPU / Compute Shader）
 
-teamLab インタラクティブチーム志望ポートフォリオ Project 3 のコア部分。
-数千〜1万の個体を **Compute Shader** でGPU計算する Boids 群れシミュレーション。
+GPU上で数千〜1万の個体を動かす Boids シミュレーション。Unity URP + Compute Shader で実装。
+
+teamLab インタラクティブチーム志望のポートフォリオとして制作。「大量の個体がルールだけで群れを作る」という創発的な挙動を、できるだけ多くの個体でリアルタイム動作させることを目標にした。
+
+## 技術的なポイント
+
+**CPU-GPU間のデータ転送をゼロにした**
+
+毎フレーム全個体の座標をCPUに戻して描画するのが素直な実装だが、個体数が増えると転送コストがボトルネックになる。このプロジェクトではGPU上で計算・描画を完結させ、CPUは Dispatch と引数バッファの更新だけに絞った。
+
+- 計算: `BoidsCompute.compute` が全個体の Boids 3原則（分離・整列・結合）をGPUで並列計算
+- 描画: `Graphics.DrawMeshInstancedIndirect` でGPUバッファを直接参照して大量描画
+
+**ダブルバッファで読み書き競合を回避**
+
+全個体が「他の全個体を参照しながら自分を更新する」ため、同じバッファに読み書きすると競合する。`boidsRead`（今フレームの状態）と `boidsWrite`（次フレームの書き込み先）を分けて毎フレームスワップすることで解決した。これを理解するのに一番時間がかかった。
+
+**近傍探索は O(N²) の総当たり**
+
+各個体が全個体との距離を計算するシンプルな実装。GPUの並列性のおかげで 8192個体でも安定して動く。さらに大規模化するなら空間ハッシュによる O(N) 最適化が次のステップ。
+
+## 詰まったところ
+
+- `StructuredBuffer` を頂点シェーダーで読む場合、`Core.hlsl` だけでは `Light` 型が未定義になる。`Lighting.hlsl` の追加インクルードが必要で、これに気づくまでシェーダーエラーで詰まった
+- ダブルバッファのスワップタイミング（Dispatch後・描画前）を間違えると個体がすべて原点に集まる
+
+## マウス操作
+
+| 操作 | 効果 |
+|------|------|
+| カーソル移動 | 弱い捕食者。群れがカーソルを避けて穴ができる |
+| 左クリック（ホールド） | 捕食者を強化。群れが勢いよく散る |
+| 右クリック（ホールド） | エサ。群れがカーソルへ集まる |
+
+`targetWeight` の符号で引き寄せ/逃避を切り替えている。重みは Lerp で補間しているので切替がなめらか。
 
 ## ファイル構成
 
 ```
 Assets/BoidsSimulation/
 ├── Shaders/
-│   ├── BoidsCompute.compute    ... GPUでのBoids3原則の計算カーネル
-│   └── BoidRenderURP.shader    ... バッファを直接読む大量描画シェーダー
+│   ├── BoidsCompute.compute    ... Boids 3原則の計算カーネル
+│   └── BoidRenderURP.shader    ... GPU バッファ直接参照の描画シェーダー
 ├── Scripts/
-│   ├── BoidsManager.cs         ... バッファ管理・Dispatch制御（計算）
-│   └── BoidsRenderer.cs        ... DrawMeshInstancedIndirectでの描画
+│   ├── BoidsManager.cs         ... バッファ管理・Dispatch 制御
+│   └── BoidsRenderer.cs        ... DrawMeshInstancedIndirect での描画
 └── README.md
 ```
 
-## セットアップ手順（Unity / URP）
+## セットアップ
 
-1. このフォルダごと Unity プロジェクトの `Assets/` 配下に置く。
-2. `BoidRenderURP` シェーダーから **マテリアルを作成**（Create > Material → Shader を `Boids/BoidRenderURP` に）。
-3. 空の GameObject を作成し `BoidsManager` と `BoidsRenderer` の両方をアタッチ。
-4. `BoidsManager` の **Compute Shader** に `BoidsCompute` を割り当てる。
-5. `BoidsRenderer` の **Boid Material** に手順2のマテリアルを割り当てる
-   （Boid Mesh は空でOK。自動で低ポリConeを生成する）。
-6. 再生すると GPU計算＋大量描画が動く。
+1. このフォルダを Unity プロジェクトの `Assets/` 直下に置く
+2. `BoidRenderURP` シェーダーからマテリアルを作成（Shader: `Boids/BoidRenderURP`）
+3. 空の GameObject に `BoidsManager` と `BoidsRenderer` をアタッチ
+4. `BoidsManager` の Compute Shader に `BoidsCompute` をアサイン
+5. `BoidsRenderer` の Boid Material に手順 2 のマテリアルをアサイン
+6. 再生
 
-> 注意：DrawMeshInstancedIndirect と StructuredBuffer読み込みには
-> SM4.5以上（DX11/Metal/Vulkan）が必要。プロジェクトのGraphics APIを確認すること。
+> SM4.5以上（DX11 / Metal / Vulkan）が必要。
 
-## 実装メモ
+## 主なパラメータ
 
-- **ダブルバッファ**：`boidsRead`（今フレーム）/`boidsWrite`（次フレーム）を
-  毎フレームスワップし「読みながら書く」競合を回避。
-- **近傍探索は総当たり O(N²)**：数千〜1万まではこれで十分。
-  さらに大規模化するなら空間ハッシュ（グリッド分割）で近傍を絞るのが次の最適化。
-- **マウスインタラクション（要件3）の土台**は実装済み。
-  `targetWeight` の符号で「捕食者（逃げる／負）」「エサ（近づく／正）」を切替。
-
-## マウス操作（要件3）
-
-`Interaction Enabled`（既定ON）で有効。カーソルはシミュレーション中心を通る
-カメラ垂直平面に投影される。
-
-| 操作 | 効果 |
-|------|------|
-| カーソル移動（既定） | 弱い捕食者。群れが避けてカーソル周りに穴ができる |
-| 左クリック（ホールド） | 捕食者を強化。群れが勢いよく散る |
-| 右クリック（ホールド） | エサ。群れがカーソルへ集まる |
-
-- 重みは `weightLerpSpeed` で滑らかに補間され、切替が急にならない。
-- `Cursor Visual` に球などを割り当てると、その見た目がカーソル位置に追従する。
-
-## 次のステップ（仕上げ）
-
-- 背景・ポストプロセス（Bloom等）、個体数や半径のチューニング。
-- さらに大規模化するなら空間ハッシュで近傍探索を O(N²)→O(N) に最適化。
-
-## 主なパラメータ（Inspectorで調整）
-
-| 項目 | 役割 |
-|------|------|
-| separationWeight / alignmentWeight / cohesionWeight | 3原則の強さ |
+| パラメータ | 役割 |
+|-----------|------|
+| separationWeight / alignmentWeight / cohesionWeight | Boids 3原則の強さ |
 | neighborRadius / separationRadius | 近傍・分離の参照半径 |
 | minSpeed / maxSpeed / maxSteerForce | 速度・操舵の制限 |
-| boundsRadius / boundsWeight | 行動範囲の球と押し戻す力 |
-| targetWeight / targetRadius | マウス影響の強さ・範囲 |
+| boundsRadius / boundsWeight | 行動範囲と押し戻す力 |
+| predatorWeight / foodWeight / targetRadius | マウスインタラクションの強さ・範囲 |

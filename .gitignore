@@ -1,0 +1,21 @@
+# Unity自動生成
+Library/
+Temp/
+Logs/
+UserSettings/
+obj/
+Build/
+Builds/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.sln
+*.csproj
+
+# Claude Code
+.claude/

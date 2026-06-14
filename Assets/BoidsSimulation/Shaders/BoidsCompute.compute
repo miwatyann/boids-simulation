@@ -1,0 +1,162 @@
+// BoidsCompute.compute
+// GPU上でBoidsの3原則（分離・整列・結合）を計算するComputeShader。
+// 各スレッドが1個体を担当し、全個体を総当たり(O(N^2))で走査して近傍を集計する。
+// 数千〜1万程度まではこの総当たりで十分。さらに大規模化する場合は
+// 空間ハッシュ(グリッド)で近傍探索を絞るのが次の最適化ステップ。
+
+#pragma kernel CSMain
+
+// 1個体のデータ。C#側のBoid構造体とメモリレイアウトを完全に一致させること
+// （float3 x2 = 24バイト）。
+struct Boid
+{
+    float3 position;
+    float3 velocity;
+};
+
+// 読み取り専用バッファ（今フレームの状態）と書き込み用バッファ（次フレームの状態）。
+// ダブルバッファにして「読みながら書く」競合を避ける。C#側で毎フレームスワップする。
+StructuredBuffer<Boid> boidsRead;
+RWStructuredBuffer<Boid> boidsWrite;
+
+uint  numBoids;     // 個体数
+float deltaTime;    // フレーム時間
+
+// --- 各ルールの重み（Inspectorから調整） ---
+float separationWeight; // 分離
+float alignmentWeight;  // 整列
+float cohesionWeight;   // 結合
+
+// --- 近傍判定の半径 ---
+float neighborRadius;   // 整列・結合の参照半径
+float separationRadius; // 分離の参照半径（neighborRadiusより小さく設定する）
+
+// --- 速度・操舵の制限 ---
+float minSpeed;
+float maxSpeed;
+float maxSteerForce; // 1ステップで加えられる操舵力の上限
+
+// --- 行動範囲（原点中心の球）に押し戻す力 ---
+float boundsRadius;
+float boundsWeight;
+
+// --- マウスインタラクション（要件3の土台） ---
+// targetWeight > 0 ：エサとして引き寄せる / targetWeight < 0 ：捕食者として逃げる
+float3 targetPosition;
+float  targetWeight;
+float  targetRadius;
+int    targetEnabled; // 0/1 でON/OFF
+
+// ベクトルの長さを上限maxでクランプする。
+float3 ClampMagnitude(float3 v, float maxLength)
+{
+    float sqr = dot(v, v);
+    if (sqr > maxLength * maxLength)
+    {
+        return normalize(v) * maxLength;
+    }
+    return v;
+}
+
+// 「目標方向へ向かうための操舵力」を返す。
+// 望ましい速度(=目標方向×maxSpeed)と現在速度の差を、maxSteerForceで制限する。
+float3 SteerTowards(float3 desiredDir, float3 velocity)
+{
+    float3 desired = normalize(desiredDir) * maxSpeed - velocity;
+    return ClampMagnitude(desired, maxSteerForce);
+}
+
+[numthreads(256, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= numBoids) return;
+
+    Boid boid = boidsRead[id.x];
+
+    // 近傍集計用のアキュムレータ
+    float3 alignmentSum  = float3(0, 0, 0); // 近傍の速度合計
+    float3 cohesionSum   = float3(0, 0, 0); // 近傍の位置合計
+    float3 separationSum = float3(0, 0, 0); // 分離方向の合計
+    int neighborCount   = 0;
+    int separationCount = 0;
+
+    // --- 全個体を総当たりして近傍を集計 ---
+    for (uint i = 0; i < numBoids; i++)
+    {
+        if (i == id.x) continue;
+
+        Boid other = boidsRead[i];
+        float3 offset = boid.position - other.position;
+        float dist = length(offset);
+
+        if (dist < neighborRadius)
+        {
+            // 整列：近傍の速度を集める
+            alignmentSum += other.velocity;
+            // 結合：近傍の位置を集める（後で重心を出す）
+            cohesionSum += other.position;
+            neighborCount++;
+
+            // 分離：近すぎる相手から離れる。近いほど強く（距離で正規化）。
+            if (dist < separationRadius && dist > 0.0001)
+            {
+                separationSum += offset / dist;
+                separationCount++;
+            }
+        }
+    }
+
+    float3 acceleration = float3(0, 0, 0);
+
+    // 分離
+    if (separationCount > 0)
+    {
+        float3 dir = separationSum / separationCount;
+        acceleration += SteerTowards(dir, boid.velocity) * separationWeight;
+    }
+
+    // 整列・結合は同じ近傍集合を使う
+    if (neighborCount > 0)
+    {
+        // 整列：近傍の平均速度に揃える
+        float3 avgVelocity = alignmentSum / neighborCount;
+        acceleration += SteerTowards(avgVelocity, boid.velocity) * alignmentWeight;
+
+        // 結合：近傍の重心へ向かう
+        float3 center = cohesionSum / neighborCount;
+        float3 toCenter = center - boid.position;
+        acceleration += SteerTowards(toCenter, boid.velocity) * cohesionWeight;
+    }
+
+    // マウスインタラクション（エサ/捕食者）
+    if (targetEnabled != 0)
+    {
+        float3 toTarget = targetPosition - boid.position;
+        if (length(toTarget) < targetRadius)
+        {
+            // targetWeightの符号で引き寄せ/逃避が切り替わる
+            acceleration += SteerTowards(toTarget, boid.velocity) * targetWeight;
+        }
+    }
+
+    // 行動範囲の外に出たら中心へ押し戻す
+    float distFromCenter = length(boid.position);
+    if (distFromCenter > boundsRadius)
+    {
+        acceleration += SteerTowards(-boid.position, boid.velocity) * boundsWeight;
+    }
+
+    // --- 速度・位置を更新 ---
+    float3 velocity = boid.velocity + acceleration * deltaTime;
+
+    // 速度の大きさをmin〜maxにクランプ（向きは保持）
+    float speed = length(velocity);
+    float3 dir2 = speed > 0.0001 ? velocity / speed : float3(0, 0, 1);
+    speed = clamp(speed, minSpeed, maxSpeed);
+    velocity = dir2 * speed;
+
+    boid.position += velocity * deltaTime;
+    boid.velocity = velocity;
+
+    boidsWrite[id.x] = boid;
+}
